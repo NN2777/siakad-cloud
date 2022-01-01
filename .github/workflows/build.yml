@@ -1,137 +1,109 @@
-name: laravel-cicd
-
+name: Laravel 6
 on:
   push:
     branches:
-      - '*'
-jobs:
-  build:
-    name: Build and Deploy
-    runs-on: ubuntu-latest
-    steps:
-      - name: 'Start build job'
-        run: |
-          echo "Starting the build job"
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: '7 3 * * *'
 
-      - name: 'Checkout'
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    container:
+      image: php:8.0-cli
+    steps:
+      - name: Checkout
         uses: actions/checkout@v2
 
-      - name: Configure PHP 8.0
-        uses: shivammathur/setup-php@master
+      - name: GitHub Environment Variables Action
+        uses: FranzDiebold/github-env-vars-action@v2.1.0
+
+      - name: PHPUnit
+        run: |
+          apt update
+          apt install -y libzip-dev unzip
+          pecl install xdebug
+          docker-php-ext-enable xdebug
+          curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+          composer require orchestra/testbench:^v4 --dev
+          XDEBUG_MODE=coverage ./vendor/bin/phpunit --coverage-clover coverage.xml --coverage-filter src/ tests/
+
+      - name: Lint
+        run: |
+          ./vendor/bin/phpcs --standard=phpcs.xml src/ tests/
+          ./vendor/bin/phpmd ./ text phpmd.xml --exclude vendor
+
+      - name: codecov
+        uses: codecov/codecov-action@v1
         with:
-          php-version: 8.0
-          extensions: mbstring, ctype, fileinfo, openssl, PDO, bcmath, json, tokenizer, xml
+          name: laravel-6
 
-      - name: Composer install
+      - name: install in real Laravel project
         run: |
-          composer update
- 
-      - name: Compile CSS and Javascript
-        run: |
-          npm install
+          rm -rf laravel-demo
+          composer create-project --prefer-dist laravel/laravel laravel-demo "6.*"
+          cd laravel-demo && composer require --dev laravel-fans/docker:dev-${CI_ACTION_REF_NAME} && php artisan docker:publish
+          php artisan --version | awk '{print $3}' > .version
 
-      - name: 'Login to Dockerhub'
+      - name: Create Tar
+        run: tar -cvf laravel-demo.tar laravel-demo
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: laravel-demo
+          path: laravel-demo.tar
+
+  publish:
+    name: Publish Code and Docker
+    if: ${{ github.ref == 'refs/heads/main' }}
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v2
+        with:
+          name: laravel-demo
+
+      - name: Extract Tar
+        run: tar -xvf laravel-demo.tar
+
+      - name: Push code
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: laravel-demo
+          publish_branch: laravel-6
+          allow_empty_commit: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Login to DockerHub
         uses: docker/login-action@v1
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
 
-      - name: 'Build and push'
+      - name: Get Laravel version
+        working-directory: ./laravel-demo
         run: |
-          docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/laravel .
-          docker push ${{ secrets.DOCKERHUB_USERNAME}}/laravel
+          echo "LARAVEL_VERSION=$(cat .version)" >> $GITHUB_ENV
+          echo "DOCKER_MANIFEST=$((DOCKER_CLI_EXPERIMENTAL=enabled docker manifest inspect laravelfans/laravel:$(cat .version) > /dev/null && echo 'json') || echo '')" >> $GITHUB_ENV
 
-      - name: 'Write config'
-        run: |
-          mkdir ~/.oci
-          echo "[DEFAULT]" >> ~/.oci/config
-          echo "user=${{secrets.OCI_USER_OCID}}" >> ~/.oci/config
-          echo "fingerprint=${{secrets.OCI_FINGERPRINT}}" >> ~/.oci/config
-          echo "region=${{secrets.OCI_REGION}}" >> ~/.oci/config
-          echo "tenancy=${{secrets.OCI_TENANCY_OCID}}" >> ~/.oci/config
-          echo "key_file=~/.oci/oci_api_key.pem" >> ~/.oci/config
-          echo "${{secrets.OCI_KEY_FILE}}" >> ~/.oci/oci_api_key.pem
-          echo "${{secrets.OCI_KEY_PUBLIC}}" >> ~/.oci/oci_api_key_public.pem
-
-      - name: 'Install OCI CLI'
-        run: |
-          curl -L -O https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh
-          chmod +x install.sh
-          ./install.sh --accept-all-defaults
-          echo "/home/runner/bin" >> $GITHUB_PATH
-          exec -l $SHELL
-
-      - name: 'Fix Config File Permissions'
-        run: |
-          oci setup repair-file-permissions --file /home/runner/.oci/config
-          oci setup repair-file-permissions --file /home/runner/.oci/oci_api_key.pem
-
-      - name: 'Check Existing Instance'
-        run: |
-          echo "INSTANCE_OCID=$( \
-            oci compute instance list \
-            --lifecycle-state RUNNING \
-            --compartment-id ${{secrets.VM_COMPARTMENT_OCID}} \
-            --display-name uas-laravel \
-            --query "data [0].id" \
-            --raw-output \
-            )" >> $GITHUB_ENV
-
-      - name: 'Create Instance'
-        if: ${{!env.INSTANCE_OCID}}
-        run: |
-          echo "INSTANCE_OCID=$( \
-            oci compute instance launch \
-            -c ${{secrets.VM_COMPARTMENT_OCID}} \
-            --availability-domain ${{secrets.VM_AVAILABILITY_DOMAIN}} \
-            --shape ${{secrets.VM_SHAPE}} \
-            --shape-config '{"memoryInGBs": 1, "ocpus": 1}' \
-            --assign-public-ip true \
-            --display-name uas-laravel \
-            --image-id ${{secrets.VM_CUSTOM_IMAGE_OCID}} \
-            --ssh-authorized-keys-file /home/runner/.oci/oci_api_key_public.pem \
-            --subnet-id ${{secrets.VM_SUBNET_OCID}} \
-            --wait-for-state RUNNING \
-            --query "data.id" \
-            --raw-output \
-            )" >> $GITHUB_ENV
-      - name: 'Get Instance IP'
-        run: |
-          echo "INSTANCE_IP=$( \
-            oci compute instance list-vnics \
-            --instance-id ${{env.INSTANCE_OCID}} \
-            --query 'data [0]."public-ip"' \
-            --raw-output \
-            )" >> $GITHUB_ENV
-          echo Instance IP: ${{ env.INSTANCE_IP }}
-      - name: 'Wait for SSH'
-        run: |
-          while ! nc -w5 -z ${{ env.INSTANCE_IP }} 22; do
-          sleep 5
-          echo "SSH not available..."
-          done; echo "SSH ready!"
-
-      - name: 'Deploy Deployment Configuration'
-        uses: appleboy/scp-action@master
+      - name: Build and push
+        id: docker_build
+        uses: docker/build-push-action@v2
+        if: ${{ env.DOCKER_MANIFEST == '' || github.event_name == 'push' }}
         with:
-          host: ${{ env.INSTANCE_IP }}
-          username: opc
-          key: ${{ secrets.OCI_KEY_FILE }}
-          source: "docker-compose.yml"
-          target: "./"
+          push: true
+          context: laravel-demo
+          tags: laravelfans/laravel:lts,laravelfans/laravel:6,laravelfans/laravel:${{ env.LARAVEL_VERSION }}
 
-      - name: 'Running Docker Compose'
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{env.INSTANCE_IP}}
-          username: opc
-          key: ${{secrets.OCI_KEY_FILE}}
-          script: |
-            sudo yum install -y yum-utils
-            sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-            sudo yum install -y docker-ce docker-ce-cli containerd.io
-            sudo systemctl restart docker
-            sudo firewall-cmd --zone=docker --add-service=http --permanent
-            sudo firewall-cmd --reload
-            sudo pip3 install docker-compose
-            sudo /usr/local/bin/docker-compose up -d
+      - name: Image digest
+        if: steps.docker_build.conclusion == 'success'
+        run: echo ${{ steps.docker_build.outputs.digest }}
