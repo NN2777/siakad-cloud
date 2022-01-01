@@ -1,13 +1,9 @@
-name: Laravel 6
+name: laravel-cicd
+
 on:
   push:
     branches:
-      - main
-  pull_request:
-    branches:
-      - main
-  schedule:
-    - cron: '7 3 * * *'
+      - '*'
 
 jobs:
   test:
