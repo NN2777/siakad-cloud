@@ -24,7 +24,7 @@ jobs:
 
       - name: Composer install
         run: |
-          composer update
+          composer update --ignore-platform-reqs
  
       - name: Compile CSS and Javascript
         run: |
